@@ -178,12 +178,15 @@ export default [
       },
       not: {
         getter: "getNot",
+        this: true,
       },
       resolves: {
         getter: "getResolves",
+        this: true,
       },
       rejects: {
         getter: "getRejects",
+        this: true,
       },
     },
   }),

@@ -8,12 +8,11 @@ import {
   createCallCheckCtx,
   createDoneDotAll,
 } from "node-test-helpers";
+import { tmpdir } from "node:os";
 
 const debug = process.env.DEBUG ? console.log : () => {};
 
-const platformTmpDir = `${process.platform === "darwin" ? "/private" : ""}${
-  process.env.TMPDIR
-}`.slice(0, -1); // remove trailing slash
+const platformTmpDir = require("fs").realpathSync(tmpdir());
 
 // Copyright Joyent, Inc. and other Node contributors.
 //
@@ -131,23 +130,29 @@ describe("ChildProcess.spawn()", () => {
 });
 
 describe("ChildProcess.spawn", () => {
-  const child = new ChildProcess();
-  child.spawn({
-    file: "bun",
-    // file: process.execPath,
-    args: ["--interactive"],
-    cwd: process.cwd(),
-    stdio: "pipe",
-  });
+  function getChild() {
+    const child = new ChildProcess();
+    child.spawn({
+      file: "node",
+      // file: process.execPath,
+      args: ["node", "--interactive"],
+      cwd: process.cwd(),
+      stdio: ["ignore", "ignore", "ignore", "ipc"],
+    });
+    return child;
+  }
 
   it("should spawn a process", () => {
+    const child = getChild();
     // Test that we can call spawn
 
     strictEqual(Object.hasOwn(child, "pid"), true);
     assert(Number.isInteger(child.pid));
+    child.kill();
   });
 
   it("should throw error on invalid signal", () => {
+    const child = getChild();
     // Try killing with invalid signal
     throws(
       () => {
@@ -158,6 +163,7 @@ describe("ChildProcess.spawn", () => {
   });
 
   it("should die when killed", () => {
+    const child = getChild();
     strictEqual(child.kill(), true);
   });
 });
@@ -173,8 +179,6 @@ describe("ChildProcess spawn bad stdio", () => {
 
       this.stdout.destroy();
       this.stderr.destroy();
-      this.stdout = null;
-      this.stderr = null;
 
       return err;
     };
@@ -315,7 +319,7 @@ describe("child_process cwd", () => {
   // });
 
   it("should work for valid given cwd", (done) => {
-    const tmpdir = { path: Bun.env.TMPDIR };
+    const tmpdir = { path: platformTmpDir };
     const createDone = createDoneDotAll(done);
 
     // Assume these exist, and 'pwd' gives us the right directory back
@@ -360,6 +364,8 @@ describe("child_process cwd", () => {
 
 describe("child_process default options", () => {
   it("should use process.env as default env", (done) => {
+    globalThis.process.env.TMPDIR = platformTmpDir;
+
     let child = spawn("printenv", [], {});
     let response = "";
 
@@ -373,9 +379,9 @@ describe("child_process default options", () => {
     // because the process can exit before the stream is closed and the data is read
     child.stdout.on("close", () => {
       assertOk(
-        response.includes(`TMPDIR=${process.env.TMPDIR}`),
+        response.includes(`TMPDIR=${platformTmpDir}`),
         "spawn did not use process.env as default " +
-          `(process.env.TMPDIR = ${process.env.TMPDIR})`,
+          `(process.env.TMPDIR=${platformTmpDir})`,
       );
       done();
     });
@@ -452,9 +458,9 @@ describe("child_process double pipe", () => {
 
     // // TODO(@jasnell): This does not appear to ever be
     // // emitted. It's not clear if it is necessary.
-    // sed.stdin.on("drain", (data) => {
-    //   grep.stdout.resume();
-    // });
+    sed.stdin.on("drain", (data) => {
+      grep.stdout.resume();
+    });
 
     // Propagate end from grep to sed
     grep.stdout.on(

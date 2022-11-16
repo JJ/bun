@@ -6,12 +6,10 @@ const {
   constants: { signals },
 } = import.meta.require("node:os");
 
+const { ArrayBuffer } = import.meta.primordials;
+
 const MAX_BUFFER = 1024 * 1024;
 const debug = process.env.DEBUG ? console.log : () => {};
-
-const platformTmpDir = `${process.platform === "darwin" ? "/private" : ""}${
-  process.env.TMPDIR
-}`.slice(0, -1); // remove trailing slash
 
 // Sections:
 // 1. Exported child_process functions
@@ -80,6 +78,17 @@ const platformTmpDir = `${process.platform === "darwin" ? "/private" : ""}${
 // OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 // USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+function spawnTimeoutFunction(child, timeoutHolder) {
+  var timeoutId = timeoutHolder.timeoutId;
+  if (timeoutId > -1) {
+    try {
+      child.kill(killSignal);
+    } catch (err) {
+      child.emit("error", err);
+    }
+    timeoutHolder.timeoutId = -1;
+  }
+}
 /**
  * Spawns a new process using the given `file`.
  * @param {string} file
@@ -120,7 +129,7 @@ export function spawn(file, args, options) {
         }
         timeoutId = null;
       }
-    }, options.timeout);
+    });
 
     child.once("exit", () => {
       if (timeoutId) {
@@ -493,32 +502,24 @@ export function spawnSync(file, args, options) {
   // Validate and translate the kill signal, if present.
   options.killSignal = sanitizeKillSignal(options.killSignal);
 
-  // options.stdio = getValidStdio(options.stdio || "pipe", true).stdio;
-  // if (options.input) {
-  //   const stdin = (options.stdio[0] = { ...options.stdio[0] });
-  //   stdin.input = options.input;
-  // }
-  // // We may want to pass data in on any given fd, ensure it is a valid buffer
-  // for (let i = 0; i < options.stdio.length; i++) {
-  //   const input = options.stdio[i] && options.stdio[i].input;
-  //   if (input != null) {
-  //     const pipe = (options.stdio[i] = { ...options.stdio[i] });
-  //     if (isArrayBufferView(input)) {
-  //       pipe.input = input;
-  //     } else if (typeof input === "string") {
-  //       pipe.input = Buffer.from(input, options.encoding);
-  //     } else {
-  //       throw new ERR_INVALID_ARG_TYPE(
-  //         `options.stdio[${i}]`,
-  //         ["Buffer", "TypedArray", "DataView", "string"],
-  //         input
-  //       );
-  //     }
-  //   }
-  // }
-
   const stdio = options.stdio || "pipe";
-  const bunStdio = getBunStdioOptions(stdio);
+  const bunStdio = getBunStdioFromOptions(stdio);
+
+  var { input } = options;
+  if (input) {
+    if (ArrayBufferIsView(input)) {
+      bunStdio[0] = input;
+    } else if (typeof input === "string") {
+      bunStdio[0] = Buffer.from(input, encoding || "utf8");
+    } else {
+      throw new ERR_INVALID_ARG_TYPE(
+        `options.stdio[0]`,
+        ["Buffer", "TypedArray", "DataView", "string"],
+        input,
+      );
+    }
+  }
+
   const { stdout, stderr, success, exitCode } = Bun.spawnSync({
     cmd: options.args,
     env: options.env || undefined,
@@ -546,8 +547,13 @@ export function spawnSync(file, args, options) {
   result.stderr = result.output[2];
 
   if (!success) {
-    result.error = errnoException(result.stderr, "spawnSync " + options.file);
-    result.error.path = options.file;
+    result.error = new SystemError(
+      result.output[2],
+      options.file,
+      "spawnSync",
+      -1,
+      result.status,
+    );
     result.error.spawnargs = ArrayPrototypeSlice.call(options.args, 1);
   }
 
@@ -577,10 +583,10 @@ export function spawnSync(file, args, options) {
 export function execFileSync(file, args, options) {
   ({ file, args, options } = normalizeExecFileArgs(file, args, options));
 
-  const inheritStderr = !options.stdio;
+  // const inheritStderr = !options.stdio;
   const ret = spawnSync(file, args, options);
 
-  if (inheritStderr && ret.stderr) process.stderr.write(ret.stderr);
+  // if (inheritStderr && ret.stderr) process.stderr.write(ret.stderr);
 
   const errArgs = [options.argv0 || file];
   ArrayPrototypePush.apply(errArgs, args);
@@ -612,11 +618,11 @@ export function execFileSync(file, args, options) {
  */
 export function execSync(command, options) {
   const opts = normalizeExecArgs(command, options, null);
-  const inheritStderr = !opts.options.stdio;
+  // const inheritStderr = !opts.options.stdio;
 
   const ret = spawnSync(opts.file, opts.options);
 
-  if (inheritStderr && ret.stderr) process.stderr.write(ret.stderr);
+  // if (inheritStderr && ret.stderr) process.stderr.write(ret.stderr); // TODO: Uncomment when we have process.stderr
 
   const err = checkExecSyncError(ret, undefined, command);
 
@@ -854,15 +860,14 @@ export class ChildProcess extends EventEmitter {
   connected = false;
   signalCode = null;
   exitCode = null;
-  killed = false;
   spawnfile;
   spawnargs;
   pid;
-  stdin;
-  stdout;
-  stderr;
-  stdio;
   channel;
+
+  get killed() {
+    if (this.#handle == null) return false;
+  }
 
   // constructor(options) {
   //   super(options);
@@ -877,8 +882,8 @@ export class ChildProcess extends EventEmitter {
       this.exitCode = this.#handle.exitCode;
     }
 
-    if (this.stdin) {
-      this.stdin.destroy();
+    if (this.#stdin) {
+      this.#stdin.destroy();
     }
 
     if (this.#handle) {
@@ -887,7 +892,14 @@ export class ChildProcess extends EventEmitter {
 
     if (exitCode < 0) {
       const syscall = this.spawnfile ? "spawn " + this.spawnfile : "spawn";
-      const err = errnoException(exitCode, syscall);
+
+      const err = new SystemError(
+        `Spawned process exited with error code: ${exitCode}`,
+        undefined,
+        "spawn",
+        "EUNKNOWN",
+        "ERR_CHILD_PROCESS_UNKNOWN_ERROR",
+      );
 
       if (this.spawnfile) err.path = this.spawnfile;
 
@@ -915,33 +927,73 @@ export class ChildProcess extends EventEmitter {
     this.#exited = true;
   }
 
-  #getBunSpawnIo(stdio, options) {
-    const result = [];
-    switch (stdio[0]) {
-      case "pipe":
-        result[0] = new WrappedFileSink(this.#handle.stdin);
+  #getBunSpawnIo(i, encoding) {
+    const io = this.#stdioOptions[i];
+    switch (i) {
+      case 0: {
+        switch (io) {
+          case "pipe":
+            return new WrappedFileSink(this.#handle.stdin);
+          case "inherit":
+            return process.stdin || null;
+          default:
+            return null;
+        }
+      }
+      case 2:
+      case 1: {
+        switch (io) {
+          case "pipe":
+            return ReadableFromWeb(this.#handle[fdToStdioName(i)], {
+              encoding,
+            });
+            break;
+          case "inherit":
+            return process[fdToStdioName(i)] || null;
+            break;
+          default:
+            return null;
+        }
         break;
-      case "inherit":
-        result[0] = process.stdin;
-      default:
-        result[0] = null;
-    }
-    let i = 1;
-    for (; i < stdio.length; i++) {
-      switch (stdio[i]) {
-        case "pipe":
-          result[i] = ReadableFromWeb(this.#handle[fdToStdioName(i)], {
-            encoding: options.encoding || undefined,
-          });
-          break;
-        case "inherit":
-          result[i] = process[fdToStdioName(i)];
-          break;
-        default:
-          result[i] = null;
       }
     }
-    return result;
+  }
+
+  #stdin;
+  #stdout;
+  #stderr;
+  #stdioObject;
+  #encoding;
+  #stdioOptions;
+
+  #createStdioObject() {
+    return Object.create(null, {
+      0: {
+        get: () => this.stdin,
+      },
+      1: {
+        get: () => this.stdout,
+      },
+      2: {
+        get: () => this.stderr,
+      },
+    });
+  }
+
+  get stdin() {
+    return (this.#stdin ??= this.#getBunSpawnIo(0, this.#encoding));
+  }
+
+  get stdout() {
+    return (this.#stdout ??= this.#getBunSpawnIo(1, this.#encoding));
+  }
+
+  get stderr() {
+    return (this.#stderr ??= this.#getBunSpawnIo(2, this.#encoding));
+  }
+
+  get stdio() {
+    return (this.#stdioObject ??= this.#createStdioObject());
   }
 
   spawn(options) {
@@ -967,38 +1019,36 @@ export class ChildProcess extends EventEmitter {
     // }
 
     validateString(options.file, "options.file");
-    this.spawnfile = options.file;
+    var file;
+    file = this.spawnfile = options.file;
 
-    if (options.args === undefined) {
-      this.spawnargs = [];
+    var spawnargs;
+    if (options.args == null) {
+      spawnargs = this.spawnargs = [];
     } else {
       validateArray(options.args, "options.args");
-      this.spawnargs = options.args;
+      spawnargs = this.spawnargs = options.args;
     }
 
-    const stdio = options.stdio || "pipe";
-    const bunStdio = getBunStdioOptions(stdio);
+    const stdio = options.stdio || ["pipe", "pipe", "pipe"];
+    const bunStdio = getBunStdioFromOptions(stdio);
 
-    const cmd = options.args;
     this.#handle = Bun.spawn({
-      cmd,
+      cmd: spawnargs,
       stdin: bunStdio[0],
       stdout: bunStdio[1],
       stderr: bunStdio[2],
       cwd: options.cwd || undefined,
       env: options.envPairs || undefined,
       onExit: this.#handleOnExit.bind(this),
+      lazy: true,
     });
     this.#handleExited = this.#handle.exited;
-
-    this.stdio = this.#getBunSpawnIo(bunStdio, options);
-    this.stdin = this.stdio[0];
-    this.stdout = this.stdio[1];
-    this.stderr = this.stdio[2];
+    this.#encoding = options.encoding || undefined;
+    this.#stdioOptions = bunStdio;
+    this.pid = this.#handle.pid;
 
     process.nextTick(onSpawnNT, this);
-
-    this.pid = this.#handle.pid;
 
     // If no `stdio` option was given - use default
     // let stdio = options.stdio || "pipe"; // TODO: reset default
@@ -1076,14 +1126,13 @@ export class ChildProcess extends EventEmitter {
       this.#handle.kill(signal);
     }
 
-    this.killed = true;
     this.emit("exit", null, signal);
     this.#maybeClose();
 
     // TODO: Make this actually ensure the process has exited before returning
     // await this.#handle.exited()
     // return this.#handle.killed;
-    return this.killed;
+    return this.#handle?.killed ?? true;
   }
 
   #maybeClose() {
@@ -1138,7 +1187,7 @@ function fdToStdioName(fd) {
   }
 }
 
-function getBunStdioOptions(stdio) {
+function getBunStdioFromOptions(stdio) {
   const normalizedStdio = normalizeStdio(stdio);
   // Node options:
   // pipe: just a pipe
@@ -1162,8 +1211,8 @@ function getBunStdioOptions(stdio) {
   // ignore -> null
   // inherit -> inherit (stdin/stdout/stderr)
   // Stream -> throw err for now
-
-  return normalizedStdio.map((item) => nodeToBun(item));
+  const bunStdio = normalizedStdio.map((item) => nodeToBun(item));
+  return bunStdio;
 }
 
 function normalizeStdio(stdio) {
@@ -1467,6 +1516,9 @@ var ArrayPrototypeSlice = Array.prototype.slice;
 var ArrayPrototypeUnshift = Array.prototype.unshift;
 var ArrayIsArray = Array.isArray;
 
+// var ArrayBuffer = ArrayBuffer;
+var ArrayBufferIsView = ArrayBuffer.isView;
+
 var NumberIsInteger = Number.isInteger;
 var MathAbs = Math.abs;
 
@@ -1705,8 +1757,22 @@ function ERR_INVALID_ARG_VALUE(name, value, reason) {
 }
 
 // TODO: Add actual proper error implementation here
-function errnoException(err, name) {
-  return new Error(`Error: ${name}. Internal error: ${err.message}`);
+class SystemError extends Error {
+  path;
+  syscall;
+  errno;
+  code;
+  constructor(message, path, syscall, errno, code) {
+    super(message);
+    this.path = path;
+    this.syscall = syscall;
+    this.errno = errno;
+    this.code = code;
+  }
+
+  get name() {
+    return "SystemError";
+  }
 }
 
 export default {

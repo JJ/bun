@@ -9,12 +9,11 @@ import {
   execFileSync,
   execSync,
 } from "node:child_process";
+import { tmpdir } from "node:os";
 
 const debug = process.env.DEBUG ? console.log : () => {};
 
-const platformTmpDir = `${process.platform === "darwin" ? "/private" : ""}${
-  process.env.TMPDIR
-}`.slice(0, -1); // remove trailing slash
+const platformTmpDir = require("fs").realpathSync(tmpdir());
 
 // Semver regex: https://gist.github.com/jhorsman/62eeea161a13b80e39f5249281e17c39?permalink_comment_id=2896416#gistcomment-2896416
 // Not 100% accurate, but good enough for this test
@@ -83,12 +82,12 @@ describe("spawn()", () => {
     expect(SEMVER_REGEX.test(result.trim())).toBe(true);
   });
 
-  it("should allow stdout to be read via .read() API", async () => {
+  it("should allow stdout to be read via .read() API", async (done) => {
     const child = spawn("bun", ["-v"]);
     const result: string = await new Promise((resolve) => {
       let finalData = "";
       child.stdout.on("error", (e) => {
-        console.error(e);
+        done(e);
       });
       child.stdout.on("readable", () => {
         let data;
@@ -100,6 +99,7 @@ describe("spawn()", () => {
       });
     });
     expect(SEMVER_REGEX.test(result.trim())).toBe(true);
+    done();
   });
 
   it("should accept stdio option with 'ignore' for no stdio fds", async () => {
@@ -122,7 +122,7 @@ describe("spawn()", () => {
   });
 
   it("should allow us to set cwd", async () => {
-    const child = spawn("pwd", { cwd: process.env.TMPDIR });
+    const child = spawn("pwd", { cwd: platformTmpDir });
     const result: string = await new Promise((resolve) => {
       child.stdout.on("data", (data) => {
         resolve(data.toString());
@@ -259,6 +259,18 @@ describe("execFileSync()", () => {
     const result = execFileSync("bun", ["-v"], { encoding: "utf8" });
     expect(SEMVER_REGEX.test(result.trim())).toBe(true);
   });
+
+  it("should allow us to pass input to the command", () => {
+    const result = execFileSync(
+      "node",
+      [import.meta.dir + "/spawned-child.js", "STDIN"],
+      {
+        input: "hello world!",
+        encoding: "utf8",
+      },
+    );
+    expect(result.trim()).toBe("hello world!");
+  });
 });
 
 describe("execSync()", () => {
@@ -270,11 +282,17 @@ describe("execSync()", () => {
 
 describe("Bun.spawn()", () => {
   it("should return exit code 0 on successful execution", async () => {
+    const proc = Bun.spawn({
+      cmd: ["echo", "hello"],
+      stdout: "pipe",
+    });
+
+    for await (const chunk of proc.stdout!) {
+      const text = new TextDecoder().decode(chunk);
+      expect(text.trim()).toBe("hello");
+    }
+
     const result = await new Promise((resolve) => {
-      const proc = Bun.spawn({
-        cmd: ["echo", "hello"],
-        stdout: "inherit",
-      });
       const maybeExited = Bun.peek(proc.exited);
       if (maybeExited === proc.exited) {
         proc.exited.then((code) => resolve(code));

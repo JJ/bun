@@ -1823,7 +1823,7 @@ const Arguments = struct {
                 .file = undefined,
                 .global_object = ctx.ptr(),
             };
-            var fd: FileDescriptor = std.math.maxInt(FileDescriptor);
+            var fd: FileDescriptor = JSC.Node.invalid_fd;
 
             if (arguments.next()) |arg| {
                 arguments.eat();
@@ -1918,7 +1918,7 @@ const Arguments = struct {
                 }
             }
 
-            if (fd != std.math.maxInt(FileDescriptor)) {
+            if (fd != JSC.Node.invalid_fd) {
                 stream.file = .{ .fd = fd };
             } else if (path) |path_| {
                 stream.file = .{ .path = path_ };
@@ -1957,7 +1957,7 @@ const Arguments = struct {
                 .file = undefined,
                 .global_object = ctx.ptr(),
             };
-            var fd: FileDescriptor = std.math.maxInt(FileDescriptor);
+            var fd: FileDescriptor = JSC.Node.invalid_fd;
 
             if (arguments.next()) |arg| {
                 arguments.eat();
@@ -2044,7 +2044,7 @@ const Arguments = struct {
                 }
             }
 
-            if (fd != std.math.maxInt(FileDescriptor)) {
+            if (fd != JSC.Node.invalid_fd) {
                 stream.file = .{ .fd = fd };
             } else if (path) |path_| {
                 stream.file = .{ .path = path_ };
@@ -3639,11 +3639,8 @@ pub const NodeFS = struct {
     pub fn rmdir(this: *NodeFS, args: Arguments.RmDir, comptime flavor: Flavor) Maybe(Return.Rmdir) {
         switch (comptime flavor) {
             .sync => {
-                var dir = args.old_path.sliceZ(&this.sync_error_buf);
-                switch (Syscall.getErrno(system.rmdir(dir))) {
-                    .SUCCESS => return Maybe(Return.Rmdir).success,
-                    else => |err| return Maybe(Return.Rmdir).errnoSys(err, .rmdir),
-                }
+                return Maybe(Return.Rmdir).errnoSysP(system.rmdir(args.path.sliceZ(&this.sync_error_buf)), .rmdir, args.path.slice()) orelse
+                    Maybe(Return.Rmdir).success;
             },
             else => {},
         }

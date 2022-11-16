@@ -26,7 +26,7 @@ const JSModuleLoader = JSC.JSModuleLoader;
 const JSModuleRecord = JSC.JSModuleRecord;
 const Microtask = JSC.Microtask;
 const JSPrivateDataPtr = @import("../base.zig").JSPrivateDataPtr;
-const Backtrace = @import("../../deps/backtrace.zig");
+const Backtrace = @import("../../crash_reporter.zig");
 const JSPrinter = @import("../../js_printer.zig");
 const JSLexer = @import("../../js_lexer.zig");
 const typeBaseName = @import("../../meta.zig").typeBaseName;
@@ -179,7 +179,7 @@ pub const NodePath = JSC.Node.Path;
 
 // Web Streams
 pub const JSReadableStreamBlob = JSC.WebCore.ByteBlobLoader.Source.JSReadableStreamSource;
-pub const JSReadableStreamFile = JSC.WebCore.FileBlobLoader.Source.JSReadableStreamSource;
+pub const JSReadableStreamFile = JSC.WebCore.FileReader.Source.JSReadableStreamSource;
 pub const JSReadableStreamBytes = JSC.WebCore.ByteStream.Source.JSReadableStreamSource;
 
 // Sinks
@@ -774,7 +774,7 @@ pub const ZigException = extern struct {
     pub const namespace = shim.namespace;
 
     pub const Holder = extern struct {
-        const frame_count = 24;
+        const frame_count = 32;
         pub const source_lines_count = 6;
         source_line_numbers: [source_lines_count]i32,
         source_lines: [source_lines_count]ZigString,
@@ -2555,9 +2555,7 @@ pub const ZigConsoleClient = struct {
         _: usize,
         // args
         _: *ScriptArguments,
-    ) callconv(.C) void {
-        
-    }
+    ) callconv(.C) void {}
     pub fn profile(
         // console
         _: ZigConsoleClient.Type,

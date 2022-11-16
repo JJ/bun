@@ -354,6 +354,10 @@ pub const VirtualMachine = struct {
     timer: Bun.Timer = Bun.Timer{},
     uws_event_loop: ?*uws.Loop = null,
 
+    /// hide bun:wrap from stack traces
+    /// bun:wrap is very noisy
+    hide_bun_stackframes: bool = true,
+
     is_printing_plugin: bool = false,
 
     plugin_runner: ?PluginRunner = null,
@@ -413,7 +417,6 @@ pub const VirtualMachine = struct {
     active_tasks: usize = 0,
 
     rare_data: ?*JSC.RareData = null,
-    poller: JSC.Poller = JSC.Poller{},
     us_loop_reference_count: usize = 0,
     is_us_loop_entered: bool = false,
     pending_internal_promise: *JSC.JSInternalPromise = undefined,
@@ -673,6 +676,9 @@ pub const VirtualMachine = struct {
 
         VirtualMachine.vm.bundler.configureLinker();
         try VirtualMachine.vm.bundler.configureFramework(false);
+
+        if (VirtualMachine.vm.bundler.env.get("BUN_SHOW_BUN_STACKFRAMES") != null)
+            VirtualMachine.vm.hide_bun_stackframes = false;
 
         vm.bundler.macro_context = js_ast.Macro.MacroContext.init(&vm.bundler);
 
@@ -1124,8 +1130,20 @@ pub const VirtualMachine = struct {
     pub fn processFetchLog(globalThis: *JSGlobalObject, specifier: ZigString, referrer: ZigString, log: *logger.Log, ret: *ErrorableResolvedSource, err: anyerror) void {
         switch (log.msgs.items.len) {
             0 => {
-                const msg = logger.Msg{
-                    .data = logger.rangeData(null, logger.Range.None, std.fmt.allocPrint(vm.allocator, "{s} while building {s}", .{ @errorName(err), specifier.slice() }) catch unreachable),
+                const msg: logger.Msg = brk: {
+                    if (err == error.UnexpectedPendingResolution) {
+                        break :brk logger.Msg{
+                            .data = logger.rangeData(
+                                null,
+                                logger.Range.None,
+                                std.fmt.allocPrint(vm.allocator, "Unexpected pending import in \"{s}\". To automatically install npm packages with Bun, please use an import statement instead of require() or dynamic import().\nThis error can also happen if dependencies import packages which are not referenced anywhere. Worst case, run `bun install` and opt-out of the node_modules folder until we come up with a better way to handle this error.", .{specifier.slice()}) catch unreachable,
+                            ),
+                        };
+                    }
+
+                    break :brk logger.Msg{
+                        .data = logger.rangeData(null, logger.Range.None, std.fmt.allocPrint(vm.allocator, "{s} while building {s}", .{ @errorName(err), specifier.slice() }) catch unreachable),
+                    };
                 };
                 {
                     ret.* = ErrorableResolvedSource.err(err, @ptrCast(*anyopaque, BuildError.create(globalThis, vm.bundler.allocator, msg)));
@@ -1585,6 +1603,31 @@ pub const VirtualMachine = struct {
         }
 
         var frames: []JSC.ZigStackFrame = exception.stack.frames_ptr[0..exception.stack.frames_len];
+        if (this.hide_bun_stackframes) {
+            var start_index: ?usize = null;
+            for (frames) |frame, i| {
+                if (frame.source_url.eqlComptime("bun:wrap")) {
+                    start_index = i;
+                    break;
+                }
+            }
+
+            if (start_index) |k| {
+                var j = k;
+                var i: usize = k;
+                while (i < frames.len) : (i += 1) {
+                    const frame = frames[i];
+                    if (frame.source_url.eqlComptime("bun:wrap")) {
+                        continue;
+                    }
+                    frames[j] = frame;
+                    j += 1;
+                }
+                exception.stack.frames_len = @truncate(u8, j);
+                frames.len = j;
+            }
+        }
+
         if (frames.len == 0) return;
 
         var top = &frames[0];
@@ -1758,6 +1801,7 @@ pub const VirtualMachine = struct {
             "url",
             "info",
             "pkg",
+            "errors",
         };
 
         if (error_instance != .zero and error_instance.isCell() and error_instance.jsType().canGet()) {
@@ -1982,14 +2026,9 @@ pub const EventListenerMixin = struct {
                 if (arguments.len == 0 or arguments.len == 1 or !js.JSValueIsString(ctx, arguments[0]) or !js.JSValueIsObject(ctx, arguments[arguments.len - 1]) or !js.JSObjectIsFunction(ctx, arguments[arguments.len - 1])) {
                     return js.JSValueMakeUndefined(ctx);
                 }
-
-                const name_len = js.JSStringGetLength(arguments[0]);
-                if (name_len > event_listener_names_buf.len) {
-                    return js.JSValueMakeUndefined(ctx);
-                }
-
-                const name_used_len = js.JSStringGetUTF8CString(arguments[0], &event_listener_names_buf, event_listener_names_buf.len);
-                const name = event_listener_names_buf[0 .. name_used_len - 1];
+                var name_slice = JSValue.c(arguments[0]).toSlice(ctx, ctx.allocator());
+                defer name_slice.deinit();
+                const name = name_slice.slice();
                 const event = EventType.match(name) orelse return js.JSValueMakeUndefined(ctx);
                 var entry = VirtualMachine.vm.event_listeners.getOrPut(event) catch unreachable;
 

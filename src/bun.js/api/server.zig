@@ -2632,13 +2632,14 @@ pub const ServerWebSocket = struct {
 
             if (!this.closed) {
                 this.closed = true;
-                this.websocket.end(1000, "");
+                // we un-gracefully close the connection if there was an exception
+                // we don't want any event handlers to fire after this for anything other than error()
+                // https://github.com/oven-sh/bun/issues/1480
+                this.websocket.close();
+                handler.active_connections -|= 1;
+                this_value.unprotect();
             }
 
-            _ = ServerWebSocket.dangerouslySetPtr(this_value, null);
-            handler.active_connections -|= 1;
-            this_value.unprotect();
-            bun.default_allocator.destroy(this);
             if (error_handler.isEmptyOrUndefinedOrNull()) {
                 globalObject.bunVM().runErrorHandler(result, null);
             } else {
@@ -2778,8 +2779,13 @@ pub const ServerWebSocket = struct {
     pub fn onClose(this: *ServerWebSocket, _: uws.AnyWebSocket, code: i32, message: []const u8) void {
         log("onClose", .{});
         var handler = this.handler;
+        const was_closed = this.closed;
         this.closed = true;
-        defer handler.active_connections -|= 1;
+        defer {
+            if (!was_closed) {
+                handler.active_connections -|= 1;
+            }
+        }
 
         if (handler.onClose != .zero) {
             const result = handler.onClose.call(
@@ -2806,6 +2812,7 @@ pub const ServerWebSocket = struct {
     }
 
     pub fn finalize(this: *ServerWebSocket) callconv(.C) void {
+        log("finalize", .{});
         bun.default_allocator.destroy(this);
     }
 
@@ -3613,6 +3620,8 @@ pub fn NewServer(comptime ssl_enabled_: bool, comptime debug_mode_: bool) type {
 
         pub const App = uws.NewApp(ssl_enabled);
 
+        const httplog = Output.scoped(.Server, false);
+
         listener: ?*App.ListenSocket = null,
         thisObject: JSC.JSValue = JSC.JSValue.zero,
         app: *App = undefined,
@@ -3648,6 +3657,10 @@ pub fn NewServer(comptime ssl_enabled_: bool, comptime debug_mode_: bool) type {
                 .upgrade = .{
                     .rfn = JSC.wrapSync(ThisServer, "onUpgrade"),
                 },
+
+                .publish = .{
+                    .rfn = JSC.wrapSync(ThisServer, "publish"),
+                },
             },
             .{
                 .port = .{
@@ -3670,6 +3683,63 @@ pub fn NewServer(comptime ssl_enabled_: bool, comptime debug_mode_: bool) type {
                 },
             },
         );
+
+        pub fn publish(this: *ThisServer, globalThis: *JSC.JSGlobalObject, topic: ZigString, message_value: JSValue, compress_value: ?JSValue, exception: JSC.C.ExceptionRef) JSValue {
+            if (this.config.websocket == null)
+                return JSValue.jsNumber(0);
+
+            var app = this.app;
+
+            if (topic.len == 0) {
+                httplog("publish() topic invalid", .{});
+                JSC.JSError(this.vm.allocator, "publish requires a topic string", .{}, globalThis, exception);
+                return .zero;
+            }
+
+            var topic_slice = topic.toSlice(bun.default_allocator);
+            defer topic_slice.deinit();
+            if (topic_slice.len == 0) {
+                JSC.JSError(this.vm.allocator, "publish requires a non-empty topic", .{}, globalThis, exception);
+                return .zero;
+            }
+
+            const compress = (compress_value orelse JSValue.jsBoolean(true)).toBoolean();
+
+            if (message_value.isEmptyOrUndefinedOrNull()) {
+                JSC.JSError(this.vm.allocator, "publish requires a non-empty message", .{}, globalThis, exception);
+                return .zero;
+            }
+
+            if (message_value.asArrayBuffer(globalThis)) |buffer| {
+                if (buffer.len == 0) {
+                    JSC.JSError(this.vm.allocator, "publish requires a non-empty message", .{}, globalThis, exception);
+                    return .zero;
+                }
+
+                return JSValue.jsNumber(
+                    // if 0, return 0
+                    // else return number of bytes sent
+                    @as(i32, @boolToInt(uws.AnyWebSocket.publishWithOptions(ssl_enabled, app, topic_slice.slice(), buffer.slice(), .binary, compress))) * @intCast(i32, @truncate(u31, buffer.len)),
+                );
+            }
+
+            {
+                var string_slice = message_value.toSlice(globalThis, bun.default_allocator);
+                defer string_slice.deinit();
+                if (string_slice.len == 0) {
+                    return JSValue.jsNumber(0);
+                }
+
+                const buffer = string_slice.slice();
+                return JSValue.jsNumber(
+                    // if 0, return 0
+                    // else return number of bytes sent
+                    @as(i32, @boolToInt(uws.AnyWebSocket.publishWithOptions(ssl_enabled, app, topic_slice.slice(), buffer, .text, compress))) * @intCast(i32, @truncate(u31, buffer.len)),
+                );
+            }
+
+            return .zero;
+        }
 
         pub fn onUpgrade(
             this: *ThisServer,
@@ -4029,6 +4099,7 @@ pub fn NewServer(comptime ssl_enabled_: bool, comptime debug_mode_: bool) type {
         }
 
         pub fn finalize(this: *ThisServer) void {
+            httplog("finalize", .{});
             this.has_js_deinited = true;
             this.deinitIfWeCan();
         }
@@ -4043,6 +4114,7 @@ pub fn NewServer(comptime ssl_enabled_: bool, comptime debug_mode_: bool) type {
         }
 
         pub fn deinitIfWeCan(this: *ThisServer) void {
+            httplog("deinitIfWeCan", .{});
             if (this.pending_requests == 0 and this.listener == null and this.has_js_deinited and !this.hasActiveWebSockets()) {
                 if (this.config.websocket) |*ws| {
                     ws.handler.app = null;
@@ -4065,6 +4137,7 @@ pub fn NewServer(comptime ssl_enabled_: bool, comptime debug_mode_: bool) type {
         }
 
         pub fn deinit(this: *ThisServer) void {
+            httplog("deinit", .{});
             this.app.destroy();
             const allocator = this.allocator;
             allocator.destroy(this);

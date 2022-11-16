@@ -471,14 +471,11 @@ pub const Response = struct {
     }
 };
 
-const null_fd = std.math.maxInt(JSC.Node.FileDescriptor);
+const null_fd = JSC.Node.invalid_fd;
 
 pub const Fetch = struct {
     const headers_string = "headers";
     const method_string = "method";
-
-    var fetch_body_string: MutableString = undefined;
-    var fetch_body_string_loaded = false;
 
     const JSType = js.JSType;
 

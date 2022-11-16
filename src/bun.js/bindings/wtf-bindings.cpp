@@ -1,6 +1,8 @@
 #include "wtf-bindings.h"
 #include "wtf/text/Base64.h"
 
+#include "wtf/StackTrace.h"
+
 extern "C" void WTF__copyLCharsFromUCharSource(LChar* destination, const UChar* source, size_t length)
 {
     WTF::StringImpl::copyCharacters(destination, source, length);
@@ -11,4 +13,36 @@ extern "C" JSC::EncodedJSValue WTF__toBase64URLStringValue(const uint8_t* bytes,
     WTF::String string = WTF::base64URLEncodeToString(reinterpret_cast<const LChar*>(bytes), static_cast<unsigned int>(length));
     string.impl()->ref();
     return JSC::JSValue::encode(JSC::jsString(globalObject->vm(), string));
+}
+
+extern "C" void Bun__crashReportWrite(void* ctx, const char* message, size_t length);
+extern "C" void Bun__crashReportDumpStackTrace(void* ctx)
+{
+    static constexpr int framesToShow = 32;
+    static constexpr int framesToSkip = 2;
+    void* stack[framesToShow + framesToSkip];
+    int frames = framesToShow + framesToSkip;
+    WTFGetBacktrace(stack, &frames);
+    int size = frames - framesToSkip;
+    bool isFirst = true;
+    for (int frameNumber = 0; frameNumber < size; ++frameNumber) {
+        auto demangled = WTF::StackTraceSymbolResolver::demangle(stack[frameNumber]);
+      
+        StringPrintStream out;
+        if (isFirst) {
+            isFirst = false;
+            if (demangled)
+                out.printf("\n%-3d %p %s", frameNumber, stack[frameNumber], demangled->demangledName() ? demangled->demangledName() : demangled->mangledName());
+            else
+                out.printf("\n%-3d %p", frameNumber, stack[frameNumber]);
+        } else {
+            if (demangled)
+                out.printf("%-3d ??? %s", frameNumber, demangled->demangledName() ? demangled->demangledName() : demangled->mangledName());
+            else
+                out.printf("%-3d ???", frameNumber);
+        }
+
+        auto str = out.toCString();
+        Bun__crashReportWrite(ctx, str.data(), str.length());
+    }
 }

@@ -16,6 +16,8 @@ const C = @import("../../global.zig").C;
 const linux = os.linux;
 const Maybe = JSC.Maybe;
 
+const log = bun.Output.scoped(.SYS, false);
+
 // On Linux AARCh64, zig is missing stat & lstat syscalls
 const use_libc = (Environment.isLinux and Environment.isAarch64) or Environment.isMac;
 pub const system = if (Environment.isLinux) linux else @import("io").darwin;
@@ -101,6 +103,7 @@ pub const Tag = enum(u8) {
     epoll_ctl,
     kill,
     waitpid,
+    posix_spawn,
     pub var strings = std.EnumMap(Tag, JSC.C.JSStringRef).initFull(null);
 };
 const PathString = @import("../../global.zig").PathString;
@@ -179,6 +182,7 @@ pub fn getErrno(rc: anytype) std.os.E {
 pub fn open(file_path: [:0]const u8, flags: JSC.Node.Mode, perm: JSC.Node.Mode) Maybe(JSC.Node.FileDescriptor) {
     while (true) {
         const rc = Syscall.system.open(file_path, flags, perm);
+        log("open({s}): {d}", .{ file_path, rc });
         return switch (Syscall.getErrno(rc)) {
             .SUCCESS => .{ .result = @intCast(JSC.Node.FileDescriptor, rc) },
             .INTR => continue,
@@ -199,6 +203,7 @@ pub fn open(file_path: [:0]const u8, flags: JSC.Node.Mode, perm: JSC.Node.Mode) 
 // The zig standard library marks BADF as unreachable
 // That error is not unreachable for us
 pub fn close(fd: std.os.fd_t) ?Syscall.Error {
+    log("close({d})", .{fd});
     if (comptime Environment.isMac) {
         // This avoids the EINTR problem.
         return switch (system.getErrno(system.@"close$NOCANCEL"(fd))) {
@@ -226,15 +231,29 @@ const max_count = switch (builtin.os.tag) {
 pub fn write(fd: os.fd_t, bytes: []const u8) Maybe(usize) {
     const adjusted_len = @minimum(max_count, bytes.len);
 
-    while (true) {
-        const rc = sys.write(fd, bytes.ptr, adjusted_len);
-        if (Maybe(usize).errnoSys(rc, .write)) |err| {
-            if (err.getErrno() == .INTR) continue;
+    if (comptime Environment.isMac) {
+        const rc = system.@"write$NOCANCEL"(fd, bytes.ptr, adjusted_len);
+        log("write({d}, {d}) = {d}", .{ fd, adjusted_len, rc });
+
+        if (Maybe(usize).errnoSysFd(rc, .write, fd)) |err| {
             return err;
         }
+
         return Maybe(usize){ .result = @intCast(usize, rc) };
+    } else {
+        while (true) {
+            const rc = sys.write(fd, bytes.ptr, adjusted_len);
+            log("write({d}, {d}) = {d}", .{ fd, adjusted_len, rc });
+
+            if (Maybe(usize).errnoSysFd(rc, .write, fd)) |err| {
+                if (err.getErrno() == .INTR) continue;
+                return err;
+            }
+
+            return Maybe(usize){ .result = @intCast(usize, rc) };
+        }
+        unreachable;
     }
-    unreachable;
 }
 
 const pread_sym = if (builtin.os.tag == .linux and builtin.link_libc)
@@ -271,7 +290,7 @@ pub fn pwrite(fd: os.fd_t, bytes: []const u8, offset: i64) Maybe(usize) {
     const ioffset = @bitCast(i64, offset); // the OS treats this as unsigned
     while (true) {
         const rc = pwrite_sym(fd, bytes.ptr, adjusted_len, ioffset);
-        return if (Maybe(usize).errnoSys(rc, .pwrite)) |err| {
+        return if (Maybe(usize).errnoSysFd(rc, .pwrite, fd)) |err| {
             switch (err.getErrno()) {
                 .INTR => continue,
                 else => return err,
@@ -286,6 +305,9 @@ pub fn read(fd: os.fd_t, buf: []u8) Maybe(usize) {
     const adjusted_len = @minimum(buf.len, max_count);
     if (comptime Environment.isMac) {
         const rc = system.@"read$NOCANCEL"(fd, buf.ptr, adjusted_len);
+
+        log("read({d}, {d}) = {d}", .{ fd, adjusted_len, rc });
+
         if (Maybe(usize).errnoSys(rc, .read)) |err| {
             return err;
         }
@@ -293,7 +315,9 @@ pub fn read(fd: os.fd_t, buf: []u8) Maybe(usize) {
     } else {
         while (true) {
             const rc = sys.read(fd, buf.ptr, adjusted_len);
-            if (Maybe(usize).errnoSys(rc, .read)) |err| {
+            log("read({d}, {d}) = {d}", .{ fd, adjusted_len, rc });
+
+            if (Maybe(usize).errnoSysFd(rc, .read, fd)) |err| {
                 if (err.getErrno() == .INTR) continue;
                 return err;
             }
@@ -313,7 +337,7 @@ pub fn recv(fd: os.fd_t, buf: []u8, flag: u32) Maybe(usize) {
     } else {
         while (true) {
             const rc = linux.recvfrom(fd, buf.ptr, buf.len, flag | os.SOCK.CLOEXEC | linux.MSG.CMSG_CLOEXEC, null, null);
-            if (Maybe(usize).errnoSys(rc, .recv)) |err| {
+            if (Maybe(usize).errnoSysFd(rc, .recv, fd)) |err| {
                 if (err.getErrno() == .INTR) continue;
                 return err;
             }
@@ -659,3 +683,67 @@ pub const Error = struct {
         return this.toSystemError().toErrorInstance(ptr);
     }
 };
+
+pub fn setPipeCapacityOnLinux(fd: JSC.Node.FileDescriptor, capacity: usize) Maybe(usize) {
+    if (comptime !Environment.isLinux) @compileError("Linux-only");
+    std.debug.assert(capacity > 0);
+
+    // In  Linux  versions  before 2.6.11, the capacity of a
+    // pipe was the same as the system page size (e.g., 4096
+    // bytes on i386).  Since Linux 2.6.11, the pipe
+    // capacity is 16 pages (i.e., 65,536 bytes in a system
+    // with a page size of 4096 bytes).  Since Linux 2.6.35,
+    // the default pipe capacity is 16 pages, but the
+    // capacity can be queried  and  set  using  the
+    // fcntl(2) F_GETPIPE_SZ and F_SETPIPE_SZ operations.
+    // See fcntl(2) for more information.
+    //:# define F_SETPIPE_SZ    1031    /* Set pipe page size array.
+    const F_SETPIPE_SZ = 1031;
+    const F_GETPIPE_SZ = 1032;
+
+    // We don't use glibc here
+    // It didn't work. Always returned 0.
+    const pipe_len = std.os.linux.fcntl(fd, F_GETPIPE_SZ, 0);
+    if (Maybe(usize).errno(pipe_len)) |err| return err;
+    if (pipe_len == 0) return Maybe(usize){ .result = 0 };
+    if (pipe_len >= capacity) return Maybe(usize){ .result = pipe_len };
+
+    const new_pipe_len = std.os.linux.fcntl(fd, F_SETPIPE_SZ, capacity);
+    if (Maybe(usize).errno(new_pipe_len)) |err| return err;
+    return Maybe(usize){ .result = new_pipe_len };
+}
+
+pub fn getMaxPipeSizeOnLinux() usize {
+    return @intCast(
+        usize,
+        bun.once(struct {
+            fn once() c_int {
+                const strings = bun.strings;
+                const default_out_size = 512 * 1024;
+                const pipe_max_size_fd = switch (JSC.Node.Syscall.open("/proc/sys/fs/pipe-max-size", std.os.O.RDONLY, 0)) {
+                    .result => |fd2| fd2,
+                    .err => |err| {
+                        log("Failed to open /proc/sys/fs/pipe-max-size: {d}\n", .{err.errno});
+                        return default_out_size;
+                    },
+                };
+                defer _ = JSC.Node.Syscall.close(pipe_max_size_fd);
+                var max_pipe_size_buf: [128]u8 = undefined;
+                const max_pipe_size = switch (JSC.Node.Syscall.read(pipe_max_size_fd, max_pipe_size_buf[0..])) {
+                    .result => |bytes_read| std.fmt.parseInt(i64, strings.trim(max_pipe_size_buf[0..bytes_read], "\n"), 10) catch |err| {
+                        log("Failed to parse /proc/sys/fs/pipe-max-size: {any}\n", .{@errorName(err)});
+                        return default_out_size;
+                    },
+                    .err => |err| {
+                        log("Failed to read /proc/sys/fs/pipe-max-size: {d}\n", .{err.errno});
+                        return default_out_size;
+                    },
+                };
+
+                // we set the absolute max to 8 MB because honestly that's a huge pipe
+                // my current linux machine only goes up to 1 MB, so that's very unlikely to be hit
+                return @minimum(@truncate(c_int, max_pipe_size -| 32), 1024 * 1024 * 8);
+            }
+        }.once, c_int),
+    );
+}
